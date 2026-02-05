@@ -1,0 +1,45 @@
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+
+# Terraform CLI local settings
+.terraformrc
+terraform.rc
+
+# Variable files (often contain secrets)
+*.tfvars
+*.tfvars.json
+
+# Override files
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Build artifacts
+build/
+dist/
+*.zip
+
+# Local editor/OS files
+.DS_Store
+.idea/
+.vscode/
+
+# SSH keys / certs (just in case)
+*.pem
+*.key
+*.p12
+*.crt
+*.cer
+
+# Logs
+*.log
+
+build/
+dist/
+*.zip
