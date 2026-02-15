@@ -13,8 +13,6 @@ resource "aws_cloudwatch_log_group" "mysql_rotation" {
   retention_in_days = 14
 }
 
-
-
 data "aws_region" "current" {}
 data "aws_partition" "current" {}
 

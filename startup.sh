@@ -3,10 +3,39 @@ set -euxo pipefail
 
 AWS_REGION="us-west-2"
 DB_SECRET_ID="lab/rds/mysql"   # Secrets Manager secret name or ARN
+SSM_PREFIX="/lab1b/db"
+LOG_GROUP="/lab1b/app"
+APP_LOG="/var/log/app.log"
 
 dnf -y update || true
-dnf -y install nginx python3 python3-pip jq
+dnf -y install nginx python3 python3-pip jq amazon-cloudwatch-agent
 systemctl enable --now nginx
+
+# --- Lab1b: CloudWatch Agent ships /var/log/app.log to CloudWatch Logs ---
+touch "${APP_LOG}"
+chmod 644 "${APP_LOG}"
+
+cat >/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<JSON
+{
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "${APP_LOG}",
+            "log_group_name": "${LOG_GROUP}",
+            "log_stream_name": "{instance_id}"
+          }
+        ]
+      }
+    }
+  }
+}
+JSON
+
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+  -a fetch-config -m ec2 \
+  -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
 
 python3 -m pip install --upgrade pip || true
 python3 -m pip install flask pymysql boto3
@@ -14,36 +43,55 @@ python3 -m pip install flask pymysql boto3
 mkdir -p /opt/notesapp
 
 cat >/opt/notesapp/app.py <<'PY'
-import os, json, traceback
+import os, json, traceback, logging
 from flask import Flask, request
 import boto3
 import pymysql
 
 REGION    = os.environ.get("AWS_REGION", "us-west-2")
 SECRET_ID = os.environ.get("DB_SECRET_ID", "lab/rds/mysql")
+SSM_PREFIX = os.environ.get("SSM_PREFIX", "/lab1b/db")
+
+APP_LOG = "/var/log/app.log"
 
 app = Flask(__name__)
 
-def get_secret():
+logging.basicConfig(
+    filename=APP_LOG,
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
+
+def get_db_params():
+    ssm = boto3.client("ssm", region_name=REGION)
+    host = ssm.get_parameter(Name=f"{SSM_PREFIX}/host")["Parameter"]["Value"]
+    port = int(ssm.get_parameter(Name=f"{SSM_PREFIX}/port")["Parameter"]["Value"])
+    db   = ssm.get_parameter(Name=f"{SSM_PREFIX}/name")["Parameter"]["Value"]
+    return host, port, db
+
+def get_db_creds():
     sm = boto3.client("secretsmanager", region_name=REGION)
     resp = sm.get_secret_value(SecretId=SECRET_ID)
-    return json.loads(resp["SecretString"])
+    s = json.loads(resp["SecretString"])
+    return s["username"], s["password"]
 
 def conn():
-    s = get_secret()
-    host = s["host"]
-    user = s["username"]
-    pwd  = s["password"]
-    port = int(s.get("port", 3306))
-    return pymysql.connect(
-        host=host, user=user, password=pwd, port=port,
-        connect_timeout=5, autocommit=True
-    )
+    try:
+        host, port, db = get_db_params()
+        user, pwd = get_db_creds()
+        return pymysql.connect(
+            host=host, user=user, password=pwd, port=port, database=db,
+            connect_timeout=5, autocommit=True
+        )
+    except Exception as e:
+        # IMPORTANT: metric filter looks for this token
+        logging.error(f"DB_CONNECTION_FAILURE: {e}")
+        raise
 
 @app.get("/")
 def home():
     return (
-        "EC2 → RDS Notes App\n"
+        "EC2 → RDS Notes App (Lab1b)\n"
         "Try:\n"
         "  /init\n"
         "  /add?note=first_note\n"
@@ -55,8 +103,6 @@ def init():
     try:
         c = conn()
         with c.cursor() as cur:
-            cur.execute("CREATE DATABASE IF NOT EXISTS notes;")
-            cur.execute("USE notes;")
             cur.execute("""
               CREATE TABLE IF NOT EXISTS notes (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -67,11 +113,7 @@ def init():
         c.close()
         return "OK: initialized\n", 200, {"Content-Type": "text/plain; charset=utf-8"}
     except Exception as e:
-        return (
-            "ERROR /init:\n"
-            f"{e}\n\n"
-            + traceback.format_exc()
-        ), 500, {"Content-Type": "text/plain; charset=utf-8"}
+        return ("ERROR /init:\n" f"{e}\n\n" + traceback.format_exc()), 500, {"Content-Type": "text/plain; charset=utf-8"}
 
 @app.route("/add", methods=["GET", "POST"])
 def add():
@@ -81,34 +123,24 @@ def add():
     try:
         c = conn()
         with c.cursor() as cur:
-            cur.execute("USE notes;")
             cur.execute("INSERT INTO notes (note) VALUES (%s)", (note,))
         c.close()
         return "OK: inserted\n", 200, {"Content-Type": "text/plain; charset=utf-8"}
     except Exception as e:
-        return (
-            "ERROR /add:\n"
-            f"{e}\n\n"
-            + traceback.format_exc()
-        ), 500, {"Content-Type": "text/plain; charset=utf-8"}
+        return ("ERROR /add:\n" f"{e}\n\n" + traceback.format_exc()), 500, {"Content-Type": "text/plain; charset=utf-8"}
 
 @app.get("/list")
 def list_notes():
     try:
         c = conn()
         with c.cursor() as cur:
-            cur.execute("USE notes;")
             cur.execute("SELECT id, note, created_at FROM notes ORDER BY id DESC LIMIT 50;")
             rows = cur.fetchall()
         c.close()
         body = "\n".join([f"{r[0]} | {r[2]} | {r[1]}" for r in rows]) + "\n"
         return body, 200, {"Content-Type": "text/plain; charset=utf-8"}
     except Exception as e:
-        return (
-            "ERROR /list:\n"
-            f"{e}\n\n"
-            + traceback.format_exc()
-        ), 500, {"Content-Type": "text/plain; charset=utf-8"}
+        return ("ERROR /list:\n" f"{e}\n\n" + traceback.format_exc()), 500, {"Content-Type": "text/plain; charset=utf-8"}
 PY
 
 cat >/opt/notesapp/run.py <<'PY'
@@ -126,9 +158,12 @@ Wants=network-online.target
 WorkingDirectory=/opt/notesapp
 Environment=AWS_REGION=${AWS_REGION}
 Environment=DB_SECRET_ID=${DB_SECRET_ID}
+Environment=SSM_PREFIX=${SSM_PREFIX}
 ExecStart=/usr/bin/python3 /opt/notesapp/run.py
 Restart=always
 RestartSec=3
+StandardOutput=append:/var/log/app.log
+StandardError=append:/var/log/app.log
 
 [Install]
 WantedBy=multi-user.target
@@ -152,5 +187,4 @@ location / {
 NGINX
 
 nginx -t
-
-::contentReference[oaicite:0]{index=0}
+systemctl reload nginx || true
